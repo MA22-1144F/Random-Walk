@@ -200,21 +200,30 @@ class VoiceGuide {
   speak(jaText, enText, beepPattern) {
     if (!this.enabled) return;
 
-    if (this.mode === 'ja' && this.synth) {
+    // Chrome pauses SpeechSynthesis in background — resume workaround
+    if (this.synth && this.synth.paused) {
+      this.synth.resume();
+    }
+
+    if ((this.mode === 'ja' || this.mode === 'en') && this.synth) {
       this.synth.cancel();
-      const u = new SpeechSynthesisUtterance(jaText);
-      u.lang = 'ja-JP';
-      if (this.jaVoice) u.voice = this.jaVoice;
-      u.rate = 1.1;
+      const text = this.mode === 'ja' ? jaText : enText;
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = this.mode === 'ja' ? 'ja-JP' : 'en-US';
+      const v = this.mode === 'ja' ? this.jaVoice : this.enVoice;
+      if (v) u.voice = v;
+      u.rate = this.mode === 'ja' ? 1.1 : 1.0;
       u.pitch = 1.0;
+      u.volume = 1.0;
       this.synth.speak(u);
-    } else if (this.mode === 'en' && this.synth) {
-      this.synth.cancel();
-      const u = new SpeechSynthesisUtterance(enText);
-      u.lang = 'en-US';
-      if (this.enVoice) u.voice = this.enVoice;
-      u.rate = 1.0;
-      this.synth.speak(u);
+
+      // Chrome bug: speech pauses after ~15s in background
+      // Workaround: set a timer to resume if paused
+      const resumeCheck = setInterval(() => {
+        if (this.synth.paused) this.synth.resume();
+        if (!this.synth.speaking) clearInterval(resumeCheck);
+      }, 300);
+      setTimeout(() => clearInterval(resumeCheck), 10000);
     } else if (this.mode === 'beep') {
       this._playBeep(beepPattern || 'info');
     }
@@ -308,65 +317,211 @@ class VoiceGuide {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  WAKE LOCK — keep screen on + background alive
+//  BACKGROUND KEEP-ALIVE
+//  Uses <audio> element with generated stream → Android treats
+//  Chrome as "playing media" and keeps it alive even with screen off.
+//  + Media Session API for lock screen info
+//  + Notification API for alerts through lock screen
 // ═══════════════════════════════════════════════════════════
-class WakeLockManager {
+class BackgroundKeepAlive {
   constructor() {
     this.wakeLock = null;
-    this.silentAudio = null;
-    this.supported = 'wakeLock' in navigator;
+    this.audioEl = null;
+    this.audioCtx = null;
+    this.oscNode = null;
+    this.gainNode = null;
+    this.streamDest = null;
+    this.notifPermission = false;
+    this.active = false;
   }
 
   async acquire() {
-    // 1. Wake Lock API (keeps screen on)
-    if (this.supported) {
+    if (this.active) return;
+    this.active = true;
+
+    // 1. Wake Lock API (prevents screen from turning off)
+    if ('wakeLock' in navigator) {
       try {
         this.wakeLock = await navigator.wakeLock.request('screen');
         this.wakeLock.addEventListener('release', () => {
-          console.log('Wake lock released');
-          document.getElementById('wake-badge').style.display = 'none';
+          document.getElementById('wake-badge').textContent = '🎵 BGモード';
         });
         document.getElementById('wake-badge').style.display = '';
-        console.log('Wake lock acquired');
+        document.getElementById('wake-badge').textContent = '🔒 画面維持';
       } catch (e) { console.warn('Wake lock failed:', e); }
     }
 
-    // Re-acquire on visibility change
-    document.addEventListener('visibilitychange', async () => {
-      if (document.visibilityState === 'visible' && this.supported && !this.wakeLock) {
-        try {
-          this.wakeLock = await navigator.wakeLock.request('screen');
-          document.getElementById('wake-badge').style.display = '';
-        } catch (e) {}
+    // Re-acquire wake lock when returning to foreground
+    document.addEventListener('visibilitychange', this._onVisChange = async () => {
+      if (document.visibilityState === 'visible' && this.active) {
+        if ('wakeLock' in navigator) {
+          try {
+            this.wakeLock = await navigator.wakeLock.request('screen');
+            document.getElementById('wake-badge').textContent = '🔒 画面維持';
+            document.getElementById('wake-badge').style.display = '';
+          } catch (e) {}
+        }
+        // Resume audio context if suspended
+        if (this.audioCtx && this.audioCtx.state === 'suspended') {
+          this.audioCtx.resume();
+        }
       }
     });
 
-    // 2. Silent audio loop (keeps browser alive in background on mobile)
-    this._startSilentAudio();
+    // 2. CRITICAL: Audio element with MediaStream — this is what keeps
+    //    Chrome alive on Android when screen is off.
+    //    Web Audio API alone gets suspended, but an <audio> element
+    //    playing a MediaStream is treated as real media playback.
+    try {
+      this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+      // Very quiet oscillator (not silent — must produce actual audio)
+      this.oscNode = this.audioCtx.createOscillator();
+      this.oscNode.frequency.value = 1; // 1Hz — inaudible
+      this.oscNode.type = 'sine';
+
+      this.gainNode = this.audioCtx.createGain();
+      this.gainNode.gain.value = 0.01; // extremely quiet but not zero
+
+      // Route through MediaStreamDestination → <audio> element
+      this.streamDest = this.audioCtx.createMediaStreamDestination();
+      this.oscNode.connect(this.gainNode);
+      this.gainNode.connect(this.streamDest);
+
+      // Also connect to actual destination so AudioContext stays active
+      const silentGain = this.audioCtx.createGain();
+      silentGain.gain.value = 0.001;
+      this.oscNode.connect(silentGain);
+      silentGain.connect(this.audioCtx.destination);
+
+      this.oscNode.start();
+
+      // Create <audio> element — the key trick
+      this.audioEl = document.createElement('audio');
+      this.audioEl.srcObject = this.streamDest.stream;
+      this.audioEl.loop = true;
+      this.audioEl.volume = 0.01;
+      // Must call play() — this is what tells Android "media is playing"
+      await this.audioEl.play();
+
+      console.log('Background audio keep-alive started');
+    } catch (e) {
+      console.warn('Background audio failed:', e);
+    }
+
+    // 3. Media Session API — shows info on lock screen
+    this._setupMediaSession();
+
+    // 4. Request Notification permission
+    if ('Notification' in window && Notification.permission === 'default') {
+      try {
+        const perm = await Notification.requestPermission();
+        this.notifPermission = (perm === 'granted');
+      } catch (e) { console.warn('Notification permission:', e); }
+    } else if ('Notification' in window) {
+      this.notifPermission = (Notification.permission === 'granted');
+    }
+
+    console.log('Background keep-alive active, notifications:', this.notifPermission);
   }
 
-  _startSilentAudio() {
+  _setupMediaSession() {
+    if (!('mediaSession' in navigator)) return;
+
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: 'ランダム散歩',
+      artist: '散歩中...',
+      album: 'Random Walk',
+    });
+
+    // Optional: action handlers (play/pause from lock screen)
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      // Create a very quiet oscillator
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      gain.gain.value = 0.001; // nearly silent
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start();
-      this.silentAudio = { ctx, osc, gain };
-    } catch (e) { console.warn('Silent audio failed:', e); }
+      navigator.mediaSession.setActionHandler('pause', () => {
+        // Don't actually pause — we need to keep running
+        navigator.mediaSession.playbackState = 'playing';
+      });
+      navigator.mediaSession.setActionHandler('play', () => {
+        if (this.audioEl) this.audioEl.play();
+        navigator.mediaSession.playbackState = 'playing';
+      });
+    } catch (e) {}
+
+    navigator.mediaSession.playbackState = 'playing';
+  }
+
+  updateMediaSession(direction, distance) {
+    if (!('mediaSession' in navigator)) return;
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: `${direction} → ${distance}m`,
+        artist: 'ランダム散歩 🎲',
+        album: '次の交差点まで',
+      });
+    } catch (e) {}
+  }
+
+  // Send notification (works on lock screen)
+  notify(title, body, tag) {
+    if (!this.notifPermission || !('Notification' in window)) return;
+    try {
+      // Close previous notification with same tag
+      const n = new Notification(title, {
+        body: body,
+        tag: tag || 'walk-guide',
+        icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="80">🎲</text></svg>',
+        requireInteraction: false,
+        silent: false,
+        vibrate: [200, 100, 200],
+      });
+      setTimeout(() => n.close(), 8000);
+    } catch (e) { console.warn('Notification error:', e); }
+  }
+
+  // Vibrate device (works even with screen off on many Android devices)
+  vibrate(pattern) {
+    if ('vibrate' in navigator) {
+      try { navigator.vibrate(pattern); } catch (e) {}
+    }
   }
 
   release() {
-    if (this.wakeLock) { this.wakeLock.release(); this.wakeLock = null; }
-    if (this.silentAudio) {
-      this.silentAudio.osc.stop();
-      this.silentAudio.ctx.close();
-      this.silentAudio = null;
+    this.active = false;
+
+    if (this.wakeLock) {
+      try { this.wakeLock.release(); } catch (e) {}
+      this.wakeLock = null;
     }
+
+    if (this.audioEl) {
+      this.audioEl.pause();
+      this.audioEl.srcObject = null;
+      this.audioEl = null;
+    }
+
+    if (this.oscNode) {
+      try { this.oscNode.stop(); } catch (e) {}
+      this.oscNode = null;
+    }
+
+    if (this.audioCtx) {
+      try { this.audioCtx.close(); } catch (e) {}
+      this.audioCtx = null;
+    }
+
+    if (this._onVisChange) {
+      document.removeEventListener('visibilitychange', this._onVisChange);
+    }
+
+    // Clear media session
+    if ('mediaSession' in navigator) {
+      try {
+        navigator.mediaSession.metadata = null;
+        navigator.mediaSession.playbackState = 'none';
+      } catch (e) {}
+    }
+
     document.getElementById('wake-badge').style.display = 'none';
+    console.log('Background keep-alive released');
   }
 }
 
@@ -441,7 +596,7 @@ const TILES={
 //  APP STATE
 // ═══════════════════════════════════════════════════════════
 const voice = new VoiceGuide();
-const wakeLock = new WakeLockManager();
+const bgKeepAlive = new BackgroundKeepAlive();
 
 const app = {
   map:null,tileLayer:null,graph:new RoadGraph(),kalman:new GPSKalman(),sd:new StationaryDetector(),
@@ -495,7 +650,7 @@ async function startWalk(){
   if(!ok){btn.textContent='🎲 ランダム散歩 開始';btn.disabled=false;return;}
 
   // Acquire wake lock for background
-  wakeLock.acquire();
+  bgKeepAlive.acquire();
 
   app.state='IDLE';btn.style.display='none';
   document.getElementById('btn-stop').style.display='';
@@ -552,6 +707,10 @@ function navSeg(seg){
     const b=bearing(sn.lat,sn.lon,np.lat,np.lon);
     const d=bearingToDir(b);
     voice.announceDirection(d.name, d.nameEn, seg.dist, d.idx);
+    // Lock screen + notification
+    bgKeepAlive.updateMediaSession(`${d.arrow} ${d.name}`, seg.dist);
+    bgKeepAlive.notify('🎲 ' + d.arrow + ' ' + d.name + 'へ進む', seg.dist + 'm先の交差点まで', 'direction');
+    bgKeepAlive.vibrate([100, 50, 100, 50, 200]);
   }
 
   if(app.simMode||app.manualMode) startSim(seg);
@@ -570,7 +729,11 @@ function updateBanner(){
   if(!app.approachAlerted && dist < 40 && app.segmentWalkedDist > 10){
     app.approachAlerted = true;
     voice.announceApproaching(Math.round(dist));
+    bgKeepAlive.notify('⚠️ まもなく交差点', 'あと' + Math.round(dist) + 'm', 'approach');
+    bgKeepAlive.vibrate([200, 100, 200, 100, 200]);
   }
+  // Update lock screen
+  bgKeepAlive.updateMediaSession(`${d.arrow} ${d.name}`, Math.round(dist));
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -607,6 +770,8 @@ function checkArr(lat,lon,now,moving){
     app.state='ARRIVING';
     showToast('🎯 交差点に到着！');
     voice.announceArrived();
+    bgKeepAlive.notify('🎯 交差点に到着！', '次の方向を決めます...', 'arrived');
+    bgKeepAlive.vibrate([100, 80, 100, 80, 100, 80, 300]);
     if(app.pathLine)app.map.removeLayer(app.pathLine);if(app.nextMarker)app.map.removeLayer(app.nextMarker);
     app.currentIntersection=app.targetIntersection;app.lastArrivalTime=now;
     setTimeout(pickNext,600);
@@ -629,7 +794,7 @@ function stopWalk(){
   const btn=document.getElementById('btn-start');btn.style.display='';btn.disabled=false;btn.textContent='🎲 ランダム散歩 開始';
   if(app.manualMode)document.getElementById('tap-hint').style.display='';
   voice.announceStop(Math.round(app.totalDist), app.junctionCount);
-  wakeLock.release();
+  bgKeepAlive.release();
   showToast(`散歩完了！ ${Math.round(app.totalDist)}m / ${app.junctionCount}交差点`);
 }
 
