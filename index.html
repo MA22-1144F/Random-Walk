@@ -129,7 +129,6 @@ body{font-family:'Helvetica Neue',Helvetica,sans-serif;background:var(--bg);colo
 <!-- ── マップ閲覧バー: SHOW ON MAP モード時のみ表示 ── -->
 <div id="map-hist-bar">
   <div id="map-hist-ctrl">
-    <button class="cb" id="map-hist-back-btn" style="flex-shrink:0;padding:0 12px">← LOG</button>
     <span id="map-hist-info"></span>
     <button class="cb icon" id="map-hist-hm-btn" title="speed heatmap">~</button>
     <button class="cb icon" id="map-hist-log-btn" title="log">&equiv;</button>
@@ -734,9 +733,6 @@ $('hd-showmap').onclick=function(){
 };
 
 // マップ閲覧バーのイベント
-// ← LOG: メインマップ閲覧モード終了 → LOG一覧へ
-$('map-hist-back-btn').onclick=exitMapHistMode;
-
 // ヒートマップトグル (マップ閲覧モード中)
 $('map-hist-hm-btn').onclick=function(){
   const r=H.load().find(x=>x.id===A.mapHistId);
