@@ -63,6 +63,13 @@ body{font-family:'Helvetica Neue',Helvetica,sans-serif;background:var(--bg);colo
 .hc-row{display:flex;align-items:center;justify-content:space-between}
 .hc-arr{font-size:16px;color:var(--dm)}
 
+/* ── History actions (export / import) ── */
+#hist-actions{display:flex;gap:6px;padding:8px 10px;border-bottom:1px solid var(--bd);align-items:center}
+.ha-btn{font-size:9px;font-weight:700;letter-spacing:.1em;padding:4px 10px;border:1px solid var(--bd);border-radius:2px;background:transparent;color:var(--dm);cursor:pointer;text-transform:uppercase;flex-shrink:0}
+.ha-btn:active{background:var(--c2);color:var(--tx)}
+.ha-btn.imp{color:var(--g);border-color:rgba(74,222,128,.3)}
+#hist-count{font-size:9px;color:var(--dm);letter-spacing:.05em;flex:1;text-align:right}
+
 /* ── History detail ── */
 #hd-map{height:220px;background:#1a1a1a;flex-shrink:0}
 #hd-info{padding:12px 10px 8px}
@@ -106,6 +113,12 @@ body{font-family:'Helvetica Neue',Helvetica,sans-serif;background:var(--bg);colo
     <div class="hh">
       <span class="hh-t">LOG</span>
       <span class="hh-x" id="hx">&times;</span>
+    </div>
+    <div id="hist-actions">
+      <button class="ha-btn" id="h-exp">↑ EXPORT</button>
+      <button class="ha-btn imp" id="h-imp-btn">↓ IMPORT</button>
+      <input type="file" id="h-imp-file" accept=".json" style="display:none">
+      <span id="hist-count"></span>
     </div>
     <div id="hl"></div>
   </div>
@@ -273,6 +286,65 @@ render(){
     if(r)openHistDet(r);
   });
 }};
+
+// ── エクスポート / インポート ──
+const IO={
+  // JSON形式でデータをダウンロード
+  export(){
+    const records=H.load();
+    if(!records.length){toast('NO DATA');return;}
+    const payload={
+      version:1,
+      exported:new Date().toISOString(),
+      count:records.length,
+      records
+    };
+    const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    const ts=new Date().toLocaleString('ja-JP',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).replace(/[\/:]/g,'-').replace(/\s/g,'_');
+    a.href=url;a.download=`sanpath_${ts}.json`;
+    document.body.appendChild(a);a.click();
+    document.body.removeChild(a);URL.revokeObjectURL(url);
+    toast(`${records.length}件をエクスポート`);
+  },
+  // JSONファイルを読み込んでマージ（IDが重複するものはスキップ）
+  import(file){
+    if(!file)return;
+    const reader=new FileReader();
+    reader.onload=e=>{
+      try{
+        const data=JSON.parse(e.target.result);
+        // バージョン1形式またはレガシー配列形式に対応
+        const incoming=Array.isArray(data)?data:(data.records||[]);
+        if(!incoming.length){toast('データなし');return;}
+        const existing=H.load();
+        const existIds=new Set(existing.map(r=>r.id));
+        const newRecs=incoming.filter(r=>r&&r.id&&!existIds.has(r.id));
+        if(!newRecs.length){toast('追加できる新規データなし');return;}
+        // 新しいものを先頭にマージして保存
+        const merged=[...existing,...newRecs]
+          .sort((a,b)=>String(b.id).localeCompare(String(a.id)))
+          .slice(0,50);
+        H.save(merged);
+        H.render();
+        updateHistCount();
+        renderAllHistRoutes();
+        toast(`${newRecs.length}件を追加（計${merged.length}件）`);
+      }catch(err){
+        toast('読み込みエラー: JSONが不正です');
+      }
+    };
+    reader.readAsText(file,'UTF-8');
+  }
+};
+
+// LOG一覧の件数表示を更新
+function updateHistCount(){
+  const n=H.load().length;
+  const el=$('hist-count');
+  if(el)el.textContent=n?`${n} / 50件`:'';
+}
 
 // ── Tiles ──
 const TL={std:{u:'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',a:'OSM',z:19},dark:{u:'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',a:'CARTO',z:20},sat:{u:'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',a:'Esri',z:19},pale:{u:'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',a:'CARTO',z:20}};
@@ -661,6 +733,7 @@ function closeHistDet(){
 // ── 履歴パネル開閉 ──
 function openHist(){
   H.render();
+  updateHistCount();
   $('hist').classList.add('open');
   $('bar').style.display='none'; // 記録コントロールを隠す
 }
@@ -725,6 +798,11 @@ $('hd-hm').onclick=function(){
   renderHdRoute(r,HD.hm);
 };
 $('hd-memo').onblur=function(){if(HD.currentId)H.memo(HD.currentId,this.value)};
+
+// ── エクスポート / インポート イベント ──
+$('h-exp').onclick=()=>IO.export();
+$('h-imp-btn').onclick=()=>$('h-imp-file').click();
+$('h-imp-file').onchange=function(){IO.import(this.files[0]);this.value='';};
 
 // SHOW ON MAP ボタン: 詳細ビュー → メインマップ閲覧モード
 $('hd-showmap').onclick=function(){
