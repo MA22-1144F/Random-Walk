@@ -229,7 +229,7 @@ document.addEventListener('visibilitychange',this._vc=async()=>{
 });
 try{this.ctx=new(window.AudioContext||window.webkitAudioContext)();this.osc=this.ctx.createOscillator();this.osc.frequency.value=1;const g=this.ctx.createGain();g.gain.value=.01;const sd=this.ctx.createMediaStreamDestination();this.osc.connect(g);g.connect(sd);const sg=this.ctx.createGain();sg.gain.value=.001;this.osc.connect(sg);sg.connect(this.ctx.destination);this.osc.start();this.au=document.createElement('audio');this.au.srcObject=sd.stream;this.au.loop=true;this.au.volume=.01;await this.au.play()}catch(e){}
 // GPS polling: 2s主・8sバックアップ
-this.gpsFast=setInterval(()=>{if(!this.active)return;navigator.geolocation.getCurrentPosition(p=>onPos(p.coords.latitude,p.coords.longitude,p.coords.accuracy),()=>{},{enableHighAccuracy:true,maximumAge:1500,timeout:5000})},2000);
+this.gpsFast=setInterval(()=>{if(!this.active)return;navigator.geolocation.getCurrentPosition(p=>onPos(p.coords.latitude,p.coords.longitude,p.coords.accuracy),()=>{},{enableHighAccuracy:true,maximumAge:0,timeout:5000})},2000);
 this.gps=setInterval(()=>{if(!this.active)return;navigator.geolocation.getCurrentPosition(p=>onPos(p.coords.latitude,p.coords.longitude,p.coords.accuracy),()=>{},{enableHighAccuracy:true,maximumAge:3000,timeout:8000})},8000);
 if('mediaSession' in navigator){navigator.mediaSession.metadata=new MediaMetadata({title:'Sanpath',artist:'walking...'});try{navigator.mediaSession.setActionHandler('pause',()=>{navigator.mediaSession.playbackState='playing'})}catch(e){}}
 if('Notification' in window){if(Notification.permission==='default')try{this.notif=(await Notification.requestPermission())==='granted'}catch(e){}else this.notif=Notification.permission==='granted'}},
@@ -565,7 +565,8 @@ function onPos(rl,ro,acc){
   }
 
   // 通常GPSモード
-  acc=acc||100;uGPS(acc);if(acc>80)return;
+  // WALK中はバックグラウンドで精度が落ちるため閾値を大幅緩和
+  acc=acc||100;uGPS(acc);if(acc>(A.st==='WALK'?200:80))return;
   const f=A.kf.upd(rl,ro,acc,now);
   A.fp={lat:f.lat,lon:f.lon};
   A.um.setLatLng([f.lat,f.lon]);A.uc.setLatLng([f.lat,f.lon]);A.uc.setRadius(max(acc,8));
@@ -573,22 +574,26 @@ function onPos(rl,ro,acc){
   const mv=A.sd.mov();
   const l=A.wc[A.wc.length-1];
 
-  // バックグラウンド復帰時(gapMs>6s)は移動判定を緩和してラインを繋ぐ
-  const gapLarge=gapMs>6000&&A.st==='WALK';
-  const allowAdd=mv||gapLarge;
+  // WALK中は移動判定を使わず常に追加（バックグラウンド安定性優先）
+  const allowAdd=A.st==='WALK'||mv;
 
   if(allowAdd&&l){
     const d=hav(l[0],l[1],f.lat,f.lon);
-    // 通常は2〜30m、バックグラウンド復帰時は2〜150m
-    const dMax=gapLarge?150:30;
+    // WALK中は上限を500mに拡大（バックグラウンドでの大きな位置飛びに対応）
+    const dMax=A.st==='WALK'?500:30;
     if(d>2&&d<dMax){
       A.td+=d;A.swd+=d;$('s-d').textContent=round(A.td);
-      const dt=(now-(A._lastPosTime||now))/1000,kmh=dt>0?d/dt*3.6:0;
-      $('s-sp').textContent=kmh.toFixed(1);
+      const dt=(now-(A._lastPosTime||now))/1000;
+      // 60秒超のギャップ後は速度0にして異常値を防ぐ
+      const kmh=(dt>0&&dt<60)?d/dt*3.6:0;
+      $('s-sp').textContent=kmh>0?kmh.toFixed(1):'-';
       A.wc.push([f.lat,f.lon,kmh]);
       if(A.spdCol)addSpdSeg(l[0],l[1],f.lat,f.lon,kmh);
       else A.wl.addLatLng([f.lat,f.lon]);
     }
+  } else if(!l&&A.st==='WALK'){
+    A.wc.push([f.lat,f.lon,0]);
+    if(!A.spdCol)A.wl.addLatLng([f.lat,f.lon]);
   } else if(!l){
     A.wc.push([f.lat,f.lon,0]);
   }
