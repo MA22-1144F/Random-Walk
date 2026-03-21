@@ -82,6 +82,11 @@ body{font-family:'Helvetica Neue',Helvetica,sans-serif;background:var(--bg);colo
 #tap{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:810;pointer-events:none;display:none;font-size:11px;color:var(--dm);letter-spacing:.1em;border:1px solid var(--bd);padding:8px 16px;border-radius:2px;background:rgba(0,0,0,.8)}
 .leaflet-control-attribution{font-size:7px!important;opacity:.5}
 .jn{width:12px;height:12px;border-radius:50%;background:var(--g);border:2px solid var(--fg);box-shadow:0 0 6px rgba(74,222,128,.4)}
+
+/* ── マップ閲覧バー (SHOW ON MAP モード) ── */
+#map-hist-bar{position:absolute;bottom:0;left:0;right:0;z-index:900;background:var(--c1);border-top:1px solid #222;padding-bottom:calc(max(env(safe-area-inset-bottom,4px),4px) + 2px);display:none}
+#map-hist-inner{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;gap:8px}
+#map-hist-info{font-size:10px;color:var(--dm);letter-spacing:.05em;font-weight:600;flex:1;text-align:center}
 </style>
 </head>
 <body>
@@ -115,8 +120,18 @@ body{font-family:'Helvetica Neue',Helvetica,sans-serif;background:var(--bg);colo
     <div id="hd-info"></div>
     <div id="hd-ctrl">
       <button class="cb icon" id="hd-hm" title="speed heatmap">~</button>
+      <button class="cb" id="hd-showmap">SHOW ON MAP</button>
     </div>
     <textarea id="hd-memo" placeholder="memo"></textarea>
+  </div>
+</div>
+
+<!-- ── マップ閲覧バー: SHOW ON MAP モード時のみ表示 ── -->
+<div id="map-hist-bar">
+  <div id="map-hist-inner">
+    <button class="cb" id="map-hist-back-btn" style="flex-shrink:0">← LOG一覧</button>
+    <span id="map-hist-info"></span>
+    <button class="cb icon" id="map-hist-hm-btn" title="speed heatmap" style="flex-shrink:0">~</button>
   </div>
 </div>
 
@@ -268,7 +283,12 @@ startMk:null,endMk:null,
 spdCol:false,spdSegs:[],
 recGraph:null,
 histLayers:[],    // 過去経路のトーンダウン表示レイヤー
-_lastPosTime:null // バックグラウンドギャップ検出用
+_lastPosTime:null,// バックグラウンドギャップ検出用
+// ── SHOW ON MAP モード ──
+mapHistMode:false,   // 現在マップ閲覧モードか
+mapHistLayers:[],    // 表示中の経路レイヤー
+mapHistId:null,      // 表示中の履歴ID
+mapHistHm:false      // 閲覧モードのヒートマップ状態
 };
 
 // 履歴詳細ビュー状態
@@ -501,6 +521,68 @@ function onPos(rl,ro,acc){
 function startSim(seg){if(A.si)clearInterval(A.si);let i=0;const co=seg.co;A.si=setInterval(()=>{i++;if(i>=co.length){clearInterval(A.si);A.si=null;onPos(co[co.length-1].lat,co[co.length-1].lon);return}const a=co[i-1],b=co[i];let s=0;const mi=setInterval(()=>{s++;const t=s/5;onPos(a.lat+(b.lat-a.lat)*t,a.lon+(b.lon-a.lon)*t);if(s>=5)clearInterval(mi)},6)},120)}
 function uTime(){if(!A.t0)return;$('s-t').textContent=fT(floor((Date.now()-A.t0)/1000))}
 
+// ── SHOW ON MAP: 経路をメインマップで全画面閲覧 ──
+function clearMapHistLayers(){
+  A.mapHistLayers.forEach(l=>A.map.removeLayer(l));
+  A.mapHistLayers=[];
+}
+
+function drawMapHistRoute(r,useHm){
+  clearMapHistLayers();
+  if(!r.path||!r.path.length)return;
+  const ll=r.path.map(p=>[p[0],p[1]]);
+  const hasSpd=r.path[0].length>2;
+  if(useHm&&hasSpd){
+    for(let i=1;i<r.path.length;i++){
+      const a=r.path[i-1],b=r.path[i],kmh=b[2]||0;
+      A.mapHistLayers.push(L.polyline([[a[0],a[1]],[b[0],b[1]]],{color:spd2col(kmh),weight:3.5,opacity:.85}).addTo(A.map));
+    }
+  } else {
+    A.mapHistLayers.push(L.polyline(ll,{color:'#4ade80',weight:3,opacity:.8}).addTo(A.map));
+  }
+  // スタート・エンドマーカー
+  if(ll.length>0){
+    const sIc=L.divIcon({className:'',html:'<div style="width:12px;height:12px;border-radius:50%;border:2.5px solid #4ade80;background:transparent"></div>',iconSize:[12,12],iconAnchor:[6,6]});
+    A.mapHistLayers.push(L.marker(ll[0],{icon:sIc,interactive:false,zIndexOffset:500}).addTo(A.map));
+    if(ll.length>1){
+      const eIc=L.divIcon({className:'',html:'<div style="width:10px;height:10px;border-radius:50%;background:#4ade80"></div>',iconSize:[10,10],iconAnchor:[5,5]});
+      A.mapHistLayers.push(L.marker(ll[ll.length-1],{icon:eIc,interactive:false,zIndexOffset:500}).addTo(A.map));
+    }
+  }
+  if(ll.length>1)A.map.fitBounds(L.latLngBounds(ll).pad(.15));
+  else if(ll.length===1)A.map.setView(ll[0],17);
+}
+
+// SHOW ON MAP モード開始
+function showRouteOnMainMap(r){
+  A.mapHistMode=true;
+  A.mapHistId=r.id;
+  A.mapHistHm=HD.hm; // 詳細ビューのヒートマップ状態を引き継ぐ
+  // 履歴パネルを閉じる（bar は非表示のまま）
+  $('hist').classList.remove('open');
+  // 詳細ビューもリセット
+  $('hist-det').classList.remove('open');
+  if(HD.map){setTimeout(()=>{if(HD.map){HD.map.remove();HD.map=null;HD.segs=[];HD.routeLayer=null;}},300);}
+  // 経路を描画
+  drawMapHistRoute(r,A.mapHistHm);
+  // ヒートマップボタン状態を同期
+  $('map-hist-hm-btn').classList.toggle('von',A.mapHistHm);
+  // 情報表示
+  $('map-hist-info').textContent=`${r.date} · ${r.dist}m`;
+  // マップ閲覧バーを表示（#bar は引き続き非表示）
+  $('map-hist-bar').style.display='';
+  $('bar').style.display='none';
+}
+
+// SHOW ON MAP モード終了 → LOG一覧へ戻る
+function exitMapHistMode(){
+  A.mapHistMode=false;
+  clearMapHistLayers();
+  $('map-hist-bar').style.display='none';
+  // LOG一覧を開き直す
+  openHist();
+}
+
 // ── 履歴詳細ビュー ──
 function openHistDet(r){
   HD.currentId=r.id;HD.hm=false;
@@ -574,6 +656,12 @@ function openHist(){
   $('bar').style.display='none'; // 記録コントロールを隠す
 }
 function closeHist(){
+  // マップ閲覧モード中なら経路も片付ける
+  if(A.mapHistMode){
+    A.mapHistMode=false;
+    clearMapHistLayers();
+    $('map-hist-bar').style.display='none';
+  }
   closeHistDet();
   $('hist').classList.remove('open');
   $('bar').style.display=''; // 記録コントロールを戻す
@@ -628,6 +716,25 @@ $('hd-hm').onclick=function(){
   renderHdRoute(r,HD.hm);
 };
 $('hd-memo').onblur=function(){if(HD.currentId)H.memo(HD.currentId,this.value)};
+
+// SHOW ON MAP ボタン: 詳細ビュー → メインマップ閲覧モード
+$('hd-showmap').onclick=function(){
+  const r=H.load().find(x=>x.id===HD.currentId);
+  if(r)showRouteOnMainMap(r);
+};
+
+// マップ閲覧バーのイベント
+// ← LOG一覧: メインマップ閲覧モード終了 → LOG一覧へ
+$('map-hist-back-btn').onclick=exitMapHistMode;
+// ヒートマップトグル (マップ閲覧モード中)
+$('map-hist-hm-btn').onclick=function(){
+  const r=H.load().find(x=>x.id===A.mapHistId);
+  if(!r||!r.path||!r.path.length)return;
+  if(!r.path[0]||r.path[0].length<3){toast('NO SPEED DATA');return;}
+  A.mapHistHm=!A.mapHistHm;
+  this.classList.toggle('von',A.mapHistHm);
+  drawMapHistRoute(r,A.mapHistHm);
+};
 
 boot();
 </script>
